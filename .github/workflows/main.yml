@@ -1,0 +1,164 @@
+name: Linux Kernel Build
+
+on:
+  push:
+    branches: [ main, master, "*-build" ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:  # 允许手动触发
+    inputs:
+      config:
+        description: 'Custom config (defconfig name)'
+        required: false
+        default: 'x86_64_defconfig'
+
+env:
+  LINUX_VERSION: "6.x"  # 你可以修改这个版本
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        arch: [x86_64, i386, arm64]
+        config:
+          - { arch: x86_64, defconfig: "x86_64_defconfig", cross_compile: "" }
+          - { arch: i386, defconfig: "i386_defconfig", cross_compile: "" }
+          - { arch: arm64, defconfig: "defconfig", cross_compile: "aarch64-linux-gnu-" }
+        include:
+          - arch: x86_64
+            defconfig: "x86_64_defconfig"
+            cross_compile: ""
+          - arch: i386
+            defconfig: "i386_defconfig"
+            cross_compile: ""
+          - arch: arm64
+            defconfig: "defconfig"
+            cross_compile: "aarch64-linux-gnu-"
+    
+    name: Build for ${{ matrix.arch }}
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: 'recursive'
+        fetch-depth: 0
+    
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          libncurses-dev \
+          bison \
+          flex \
+          libssl-dev \
+          libelf-dev \
+          bc \
+          git \
+          gcc-aarch64-linux-gnu \
+          qemu-system-arm
+        
+        # 根据架构安装交叉编译工具
+        if [ "${{ matrix.arch }}" = "arm64" ]; then
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+        elif [ "${{ matrix.arch }}" = "i386" ]; then
+          sudo apt-get install -y gcc-multilib
+        fi
+    
+    - name: Set up build environment
+      run: |
+        echo "ARCH=${{ matrix.arch }}" >> $GITHUB_ENV
+        echo "CROSS_COMPILE=${{ matrix.cross_compile }}" >> $GITHUB_ENV
+        echo "CONFIG=${{ matrix.defconfig }}" >> $GITHUB_ENV
+    
+    - name: Clean and prepare
+      run: |
+        make mrproper
+        make ${{ matrix.defconfig }}
+    
+    - name: Build kernel
+      run: |
+        echo "Building kernel for ${{ matrix.arch }}..."
+        
+        # 编译内核
+        make -j$(nproc)
+        
+        # 编译模块
+        make modules -j$(nproc)
+        
+        # 显示构建结果
+        echo "Build completed!"
+        ls -la arch/${{ matrix.arch }}/boot/
+    
+    - name: Generate kernel version info
+      run: |
+        # 获取内核版本信息
+        make kernelversion > kernel_version.txt
+        make kernelrelease > kernel_release.txt
+        echo "Kernel architecture: ${{ matrix.arch }}" >> build_info.txt
+        echo "Defconfig used: ${{ matrix.defconfig }}" >> build_info.txt
+        date >> build_info.txt
+    
+    - name: Archive build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: kernel-build-${{ matrix.arch }}
+        path: |
+          arch/${{ matrix.arch }}/boot/
+          kernel_version.txt
+          kernel_release.txt
+          build_info.txt
+          .config
+        retention-days: 7
+    
+    - name: Archive modules
+      if: success()
+      uses: actions/upload-artifact@v4
+      with:
+        name: modules-${{ matrix.arch }}
+        path: modules.order
+        retention-days: 7
+  
+  qemu-test:
+    needs: build
+    if: github.event_name == 'workflow_dispatch'  # 只在手动触发时运行
+    runs-on: ubuntu-latest
+    name: QEMU Test (x86_64)
+    
+    steps:
+    - name: Download kernel artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: kernel-build-x86_64
+    
+    - name: Install QEMU
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y qemu-system-x86
+    
+    - name: Create initramfs for testing
+      run: |
+        # 创建一个简单的initramfs用于测试
+        mkdir -p initramfs
+        cd initramfs
+        cat > init << 'EOF'
+        #!/bin/sh
+        echo "Hello from Linux kernel!"
+        exec /bin/sh
+        EOF
+        chmod +x init
+        find . | cpio -o -H newc | gzip > ../initramfs.cpio.gz
+    
+    - name: Test boot in QEMU
+      timeout-minutes: 5
+      run: |
+        echo "Testing kernel boot in QEMU..."
+        qemu-system-x86_64 \
+          -kernel bzImage \
+          -initrd initramfs.cpio.gz \
+          -nographic \
+          -append "console=ttyS0" \
+          -m 512M
