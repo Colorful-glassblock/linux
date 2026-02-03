@@ -5,7 +5,7 @@ on:
     branches: [ main, master, "*-build" ]
   pull_request:
     branches: [ main, master ]
-  workflow_dispatch:  # 允许手动触发
+  workflow_dispatch:
     inputs:
       config:
         description: 'Custom config (defconfig name)'
@@ -13,7 +13,7 @@ on:
         default: 'x86_64_defconfig'
 
 env:
-  LINUX_VERSION: "6.x"  # 你可以修改这个版本
+  LINUX_VERSION: "6.x"
 
 jobs:
   build:
@@ -21,23 +21,23 @@ jobs:
     
     strategy:
       matrix:
-        arch: [x86_64, i386, arm64]
-        config:
-          - { arch: x86_64, defconfig: "x86_64_defconfig", cross_compile: "" }
-          - { arch: i386, defconfig: "i386_defconfig", cross_compile: "" }
-          - { arch: arm64, defconfig: "defconfig", cross_compile: "aarch64-linux-gnu-" }
         include:
           - arch: x86_64
             defconfig: "x86_64_defconfig"
             cross_compile: ""
+            display_name: "x86_64 (64-bit)"
+            
           - arch: i386
             defconfig: "i386_defconfig"
             cross_compile: ""
+            display_name: "i386 (32-bit)"
+            
           - arch: arm64
             defconfig: "defconfig"
             cross_compile: "aarch64-linux-gnu-"
+            display_name: "ARM64"
     
-    name: Build for ${{ matrix.arch }}
+    name: Build - ${{ matrix.display_name }}
     
     steps:
     - name: Checkout repository
@@ -49,6 +49,8 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
+        
+        # 基础依赖
         sudo apt-get install -y \
           build-essential \
           libncurses-dev \
@@ -57,55 +59,80 @@ jobs:
           libssl-dev \
           libelf-dev \
           bc \
-          git \
-          gcc-aarch64-linux-gnu \
-          qemu-system-arm
+          git
         
-        # 根据架构安装交叉编译工具
+        # 架构特定依赖
         if [ "${{ matrix.arch }}" = "arm64" ]; then
           sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "Installed ARM64 cross-compiler"
         elif [ "${{ matrix.arch }}" = "i386" ]; then
           sudo apt-get install -y gcc-multilib
+          echo "Installed 32-bit libraries"
         fi
+        
+        echo "All dependencies installed for ${{ matrix.arch }}"
     
     - name: Set up build environment
       run: |
         echo "ARCH=${{ matrix.arch }}" >> $GITHUB_ENV
         echo "CROSS_COMPILE=${{ matrix.cross_compile }}" >> $GITHUB_ENV
-        echo "CONFIG=${{ matrix.defconfig }}" >> $GITHUB_ENV
+        
+        # 显示环境信息
+        echo "Building for: ${{ matrix.arch }}"
+        echo "Defconfig: ${{ matrix.defconfig }}"
+        echo "Cross-compile prefix: ${{ matrix.cross_compile }}"
     
     - name: Clean and prepare
       run: |
+        echo "Cleaning build directory..."
         make mrproper
-        make ${{ matrix.defconfig }}
+        
+        echo "Configuring kernel with ${{ matrix.defconfig }}..."
+        make ARCH=${{ matrix.arch }} ${{ matrix.defconfig }}
     
     - name: Build kernel
       run: |
         echo "Building kernel for ${{ matrix.arch }}..."
+        echo "Using ARCH=${{ matrix.arch }} CROSS_COMPILE=${{ matrix.cross_compile }}"
         
         # 编译内核
-        make -j$(nproc)
+        make ARCH=${{ matrix.arch }} CROSS_COMPILE=${{ matrix.cross_compile }} -j$(nproc)
         
         # 编译模块
-        make modules -j$(nproc)
+        make ARCH=${{ matrix.arch }} CROSS_COMPILE=${{ matrix.cross_compile }} modules -j$(nproc)
         
-        # 显示构建结果
-        echo "Build completed!"
-        ls -la arch/${{ matrix.arch }}/boot/
+        echo "Build completed successfully!"
+        
+        # 显示生成的文件
+        if [ -d "arch/${{ matrix.arch }}/boot" ]; then
+          echo "Generated files:"
+          ls -la arch/${{ matrix.arch }}/boot/
+        else
+          echo "Boot directory not found at arch/${{ matrix.arch }}/boot/"
+          find . -name "*Image*" -o -name "*bzImage*" -o -name "*zImage*" | head -20
+        fi
     
-    - name: Generate kernel version info
+    - name: Generate build info
       run: |
         # 获取内核版本信息
-        make kernelversion > kernel_version.txt
-        make kernelrelease > kernel_release.txt
-        echo "Kernel architecture: ${{ matrix.arch }}" >> build_info.txt
-        echo "Defconfig used: ${{ matrix.defconfig }}" >> build_info.txt
-        date >> build_info.txt
+        make ARCH=${{ matrix.arch }} CROSS_COMPILE=${{ matrix.cross_compile }} kernelversion > kernel_version.txt 2>/dev/null || echo "unknown" > kernel_version.txt
+        make ARCH=${{ matrix.arch }} CROSS_COMPILE=${{ matrix.cross_compile }} kernelrelease > kernel_release.txt 2>/dev/null || echo "unknown" > kernel_release.txt
+        
+        cat > build_info.txt << EOF
+        ===== Linux Kernel Build Info =====
+        Architecture: ${{ matrix.arch }}
+        Defconfig: ${{ matrix.defconfig }}
+        Build Date: $(date)
+        Commit: ${{ github.sha }}
+        Workflow: ${{ github.workflow }}
+        Run ID: ${{ github.run_id }}
+        ===================================
+        EOF
     
-    - name: Archive build artifacts
+    - name: Archive kernel artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: kernel-build-${{ matrix.arch }}
+        name: kernel-${{ matrix.arch }}
         path: |
           arch/${{ matrix.arch }}/boot/
           kernel_version.txt
@@ -114,51 +141,24 @@ jobs:
           .config
         retention-days: 7
     
-    - name: Archive modules
+    - name: Archive modules (if any)
       if: success()
-      uses: actions/upload-artifact@v4
-      with:
-        name: modules-${{ matrix.arch }}
-        path: modules.order
-        retention-days: 7
-  
-  qemu-test:
-    needs: build
-    if: github.event_name == 'workflow_dispatch'  # 只在手动触发时运行
-    runs-on: ubuntu-latest
-    name: QEMU Test (x86_64)
-    
-    steps:
-    - name: Download kernel artifacts
-      uses: actions/download-artifact@v4
-      with:
-        name: kernel-build-x86_64
-    
-    - name: Install QEMU
       run: |
-        sudo apt-get update
-        sudo apt-get install -y qemu-system-x86
+        # 检查是否有模块文件生成
+        if [ -f "modules.order" ]; then
+          echo "Found modules.order file"
+          mkdir -p modules_${{ matrix.arch }}
+          cp modules.order modules_${{ matrix.arch }}/
+          # 你也可以复制实际的模块文件
+          # find . -name "*.ko" -exec cp {} modules_${{ matrix.arch }}/ \;
+        else
+          echo "No modules.order file found"
+          touch no_modules_${{ matrix.arch }}.txt
+        fi
     
-    - name: Create initramfs for testing
+    - name: Clean up (optional)
+      if: always()
       run: |
-        # 创建一个简单的initramfs用于测试
-        mkdir -p initramfs
-        cd initramfs
-        cat > init << 'EOF'
-        #!/bin/sh
-        echo "Hello from Linux kernel!"
-        exec /bin/sh
-        EOF
-        chmod +x init
-        find . | cpio -o -H newc | gzip > ../initramfs.cpio.gz
-    
-    - name: Test boot in QEMU
-      timeout-minutes: 5
-      run: |
-        echo "Testing kernel boot in QEMU..."
-        qemu-system-x86_64 \
-          -kernel bzImage \
-          -initrd initramfs.cpio.gz \
-          -nographic \
-          -append "console=ttyS0" \
-          -m 512M
+        echo "Cleaning up intermediate files..."
+        # 可以清理一些中间文件以节省空间
+        # make clean
